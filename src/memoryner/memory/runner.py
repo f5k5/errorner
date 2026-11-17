@@ -75,19 +75,15 @@ class MemoryNERAblationRunner:
             show_progress_bar=True,
         )
 
-        # Keep the repository's original ablation variants unchanged.
-        self.variants = {
-            "vanilla": {"mode": "zero_shot", "LS": False, "LE": False, "GS": False, "GE": False, "global_source": "validated", "local_source": "validated"},
-            "rag": {"mode": "paper", "LS": False, "LE": True, "GS": False, "GE": False, "global_source": "validated", "local_source": "validated"},
-            "MemoryNER": {"mode": "paper", "LS": True, "LE": True, "GS": True, "GE": True, "global_source": "validated", "local_source": "validated"},
-            "w/o hierarchical rules": {"mode": "paper_flat", "LS": True, "LE": True, "GS": True, "GE": True, "global_source": "validated", "local_source": "validated"},
-            "w/o Validation": {"mode": "paper", "LS": True, "LE": True, "GS": True, "GE": True, "global_source": "unvalidated", "local_source": "unvalidated"},
-            "w/o global generic Memory": {"mode": "paper", "LS": True, "LE": True, "GS": True, "GE": False, "global_source": "validated", "local_source": "validated"},
-            "w/o global Semantic Memory": {"mode": "paper", "LS": True, "LE": True, "GS": False, "GE": True, "global_source": "validated", "local_source": "validated"},
-            "w/o local Semantic Memory": {"mode": "paper", "LS": False, "LE": True, "GS": True, "GE": True, "global_source": "validated", "local_source": "validated"},
-            "w/o local generic Memory": {"mode": "paper", "LS": True, "LE": False, "GS": True, "GE": True, "global_source": "validated", "local_source": "validated"},
-            "w/o Coupling": {"mode": "paper_no_coupling", "LS": True, "LE": True, "GS": True, "GE": True, "global_source": "validated", "local_source": "validated"},
-        }
+    self.main_config = {
+        "mode": "paper",
+        "LS": True,
+        "LE": True,
+        "GS": True,
+        "GE": True,
+        "global_source": "validated",
+        "local_source": "validated",
+    }
 
     def _retrieve_global_rules(self, test_texts: List[str]):
         validated_batch = [[] for _ in test_texts]
