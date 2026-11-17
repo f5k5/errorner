@@ -1,0 +1,207 @@
+from typing import Any, Dict, Iterable, List, Sequence, Set, Tuple
+
+from memoryner.utils.text import normalize_prediction
+
+
+def entity_set(entities: Iterable[Dict[str, Any]]) -> Set[Tuple[str, str]]:
+    normalized = normalize_prediction(list(entities))
+    return {
+        (item["entity_text"], item["entity_type"])
+        for item in normalized
+    }
+
+
+def classify_prediction_errors(
+    text: str,
+    prediction: Sequence[Dict[str, Any]],
+    gold: Sequence[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    """
+    One-to-one span matching following Section 3.1.1.
+
+    Exact span + wrong type -> Type Error.
+    Otherwise, a containment-related span -> Boundary Error.
+    Unmatched gold -> Missed Entity.
+    Unmatched prediction -> Hallucination Error.
+
+    Grouping:
+      * missed/boundary: gold entity type
+      * hallucination: predicted entity type
+      * type error: (gold entity type, predicted entity type)
+    """
+    pred = normalize_prediction(list(prediction), original_input_text=text)
+    gold_entities = normalize_prediction(list(gold))
+    unmatched_predictions = list(enumerate(pred))
+    errors: List[Dict[str, Any]] = []
+
+    def append_error(
+        category: str,
+        group_key: str,
+        group_label: str,
+        target_gold: Dict[str, str] = None,
+        target_pred: Dict[str, str] = None,
+        message: str = "",
+    ) -> None:
+        mention = (
+            target_gold.get("entity_text") if target_gold is not None
+            else target_pred.get("entity_text") if target_pred is not None
+            else ""
+        )
+        errors.append({
+            "category": category,
+            "group_key": group_key,
+            "group_label": group_label,
+            "target_gold": dict(target_gold) if target_gold is not None else None,
+            "target_pred": dict(target_pred) if target_pred is not None else None,
+            "target_mention": mention,
+            "msg": message,
+            "text": text,
+            "gold": gold_entities,
+            "pred": pred,
+        })
+
+    for gold_entity in gold_entities:
+        gold_text = gold_entity["entity_text"]
+        gold_type = gold_entity["entity_type"]
+
+        exact_position = next(
+            (
+                position
+                for position, (_, predicted_entity) in enumerate(unmatched_predictions)
+                if predicted_entity["entity_text"] == gold_text
+            ),
+            None,
+        )
+        if exact_position is not None:
+            _, predicted_entity = unmatched_predictions.pop(exact_position)
+            predicted_type = predicted_entity["entity_type"]
+            if predicted_type != gold_type:
+                append_error(
+                    category="Type Error",
+                    group_key=f"type_error::{gold_type}::{predicted_type}",
+                    group_label=f"{gold_type} -> {predicted_type}",
+                    target_gold=gold_entity,
+                    target_pred=predicted_entity,
+                    message=(
+                        f"Predicted type {predicted_type}, correct type {gold_type}, "
+                        f"entity {gold_text}"
+                    ),
+                )
+            continue
+
+        boundary_position = next(
+            (
+                position
+                for position, (_, predicted_entity) in enumerate(unmatched_predictions)
+                if (
+                    gold_text in predicted_entity["entity_text"]
+                    or predicted_entity["entity_text"] in gold_text
+                )
+            ),
+            None,
+        )
+        if boundary_position is not None:
+            _, predicted_entity = unmatched_predictions.pop(boundary_position)
+            append_error(
+                category="Boundary Error",
+                group_key=f"boundary_error::{gold_type}",
+                group_label=gold_type,
+                target_gold=gold_entity,
+                target_pred=predicted_entity,
+                message=(
+                    f"Predicted boundary {predicted_entity['entity_text']} "
+                    f"({predicted_entity['entity_type']}), correct boundary "
+                    f"{gold_text} ({gold_type})"
+                ),
+            )
+            continue
+
+        append_error(
+            category="Missed Entity",
+            group_key=f"missed_entity::{gold_type}",
+            group_label=gold_type,
+            target_gold=gold_entity,
+            message=f"Entity {gold_text} ({gold_type}) was missed.",
+        )
+
+    for _, predicted_entity in unmatched_predictions:
+        predicted_type = predicted_entity["entity_type"]
+        append_error(
+            category="Hallucination Error",
+            group_key=f"hallucination_error::{predicted_type}",
+            group_label=predicted_type,
+            target_pred=predicted_entity,
+            message=(
+                f"Predicted {predicted_entity['entity_text']} ({predicted_type}) "
+                "but it is not an entity."
+            ),
+        )
+
+    return errors
+
+
+def is_target_error_corrected(
+    error: Dict[str, Any],
+    new_prediction: Sequence[Dict[str, Any]],
+) -> bool:
+    """Check whether the rule-guided prediction corrects this specific error."""
+    predicted = entity_set(new_prediction)
+    category = error.get("category")
+    target_gold = error.get("target_gold")
+    target_pred = error.get("target_pred")
+
+    if category == "Missed Entity":
+        if target_gold is None:
+            return False
+        return (
+            target_gold["entity_text"],
+            target_gold["entity_type"],
+        ) in predicted
+
+    if category in ("Type Error", "Boundary Error"):
+        if target_gold is None or target_pred is None:
+            return False
+        gold_key = (
+            target_gold["entity_text"],
+            target_gold["entity_type"],
+        )
+        old_prediction_key = (
+            target_pred["entity_text"],
+            target_pred["entity_type"],
+        )
+        return gold_key in predicted and old_prediction_key not in predicted
+
+    if category == "Hallucination Error":
+        if target_pred is None:
+            return False
+        old_prediction_key = (
+            target_pred["entity_text"],
+            target_pred["entity_type"],
+        )
+        return old_prediction_key not in predicted
+
+    return False
+
+
+def introduces_new_errors(
+    baseline_prediction: Sequence[Dict[str, Any]],
+    rule_prediction: Sequence[Dict[str, Any]],
+    gold: Sequence[Dict[str, Any]],
+) -> bool:
+    """
+    Return True if the rule-guided output introduces a new false positive
+    or false negative relative to the original zero-shot prediction.
+    """
+    gold_set = entity_set(gold)
+    baseline_set = entity_set(baseline_prediction)
+    rule_set = entity_set(rule_prediction)
+
+    baseline_false_positives = baseline_set - gold_set
+    baseline_false_negatives = gold_set - baseline_set
+    rule_false_positives = rule_set - gold_set
+    rule_false_negatives = gold_set - rule_set
+
+    return not (
+        rule_false_positives.issubset(baseline_false_positives)
+        and rule_false_negatives.issubset(baseline_false_negatives)
+    )
