@@ -4,174 +4,357 @@ import re
 from typing import Any, Dict, List, Tuple
 
 from memoryner.llm_engine import generate_texts, get_token_stats
-from memoryner.prompts import GLOBAL_REFLECTION_PROMPT, VERIFICATION_AGENT_PROMPT, ZERO_SHOT_PREDICTION_PROMPT
+from memoryner.memory.error_analysis import (
+    classify_prediction_errors,
+    introduces_new_errors,
+    is_target_error_corrected,
+)
+from memoryner.prompts import (
+    GLOBAL_REFLECTION_PROMPT,
+    VERIFICATION_AGENT_PROMPT,
+    ZERO_SHOT_PREDICTION_PROMPT,
+)
 from memoryner.utils.text import color_text, normalize_prediction, parse_json_robust
 
 
 class GlobalRuleLearner:
-    def __init__(self, llm: Any, labels_str: str, allowed_labels: List[str], domain_name: str):
+    def __init__(
+        self,
+        llm: Any,
+        labels_str: str,
+        allowed_labels: List[str],
+        domain_name: str,
+    ):
         self.llm = llm
         self.labels_str = labels_str
         self.allowed_labels = allowed_labels
         self.domain_name = domain_name
-        self.error_categories = ["Missed Entity", "Type Error", "Boundary Error", "Hallucination Error"]
-        self.global_rules_map_validated = {label: [] for label in allowed_labels}
-        self.global_rules_map_unvalidated = {label: [] for label in allowed_labels}
+        self.error_categories = [
+            "Missed Entity",
+            "Type Error",
+            "Boundary Error",
+            "Hallucination Error",
+        ]
+        # Keys are error-group identifiers. Type errors use a gold/predicted
+        # type pair; the other categories use the relevant single entity type.
+        self.global_rules_map_validated: Dict[str, List[Dict[str, Any]]] = {}
+        self.global_rules_map_unvalidated: Dict[str, List[Dict[str, Any]]] = {}
         self.token_usage = 0
         self.max_retries = 3
+        self.tau = 5
+        self.lambda_global = 2
         self.init_instruction = f"Allowed entity types: {self.labels_str}"
 
-    def _add_rule(self, target_map, label: str, category: str, rule: str, contexts: List[Dict[str, Any]], sources: List[str]) -> None:
+    def _add_rule(
+        self,
+        target_map: Dict[str, List[Dict[str, Any]]],
+        task: Dict[str, Any],
+        rule: str,
+        contexts: List[Dict[str, Any]],
+    ) -> None:
         rule = rule.strip()
         if not rule or len(rule) < 5:
             return
-        existing = {item["rule"] for item in target_map[label]}
-        if rule in existing:
-            return
-        target_map[label].append(
-            {
-                "label": label,
-                "category": category,
-                "rule": rule,
-                "contexts": contexts,
-                "sources": sources,
-            }
+
+        group_key = task["group_key"]
+        entries = target_map.setdefault(group_key, [])
+        existing = next(
+            (item for item in entries if item.get("rule") == rule),
+            None,
         )
+        if existing is not None:
+            known = {item.get("text") for item in existing.get("contexts", [])}
+            for context in contexts:
+                if context.get("text") not in known:
+                    existing.setdefault("contexts", []).append(context)
+                    existing.setdefault("sources", []).append(
+                        context.get("text", "")
+                    )
+                    known.add(context.get("text"))
+            return
 
-    def _classify_errors(self, samples: List[Dict[str, Any]], pred_outputs) -> Dict[str, Dict[str, List[Dict[str, Any]]]]:
-        errors_by_label_cat = {
-            label: {category: [] for category in self.error_categories}
-            for label in self.allowed_labels
-        }
+        entries.append({
+            "group_key": group_key,
+            "label": task["label"],
+            "category": task["category"],
+            "rule": rule,
+            "contexts": list(contexts),
+            "sources": [context.get("text", "") for context in contexts],
+        })
 
-        for i, output in enumerate(pred_outputs):
-            text = samples[i]["text"]
-            pred = normalize_prediction(
+    def _classify_errors(
+        self,
+        samples: List[Dict[str, Any]],
+        pred_outputs,
+    ) -> Dict[str, List[Dict[str, Any]]]:
+        errors_by_group: Dict[str, List[Dict[str, Any]]] = {}
+
+        for sample_index, output in enumerate(pred_outputs):
+            sample = samples[sample_index]
+            text = sample["text"]
+            prediction = normalize_prediction(
                 parse_json_robust(output.outputs[0].text),
                 self.allowed_labels,
                 original_input_text=text,
             )
-            gold = normalize_prediction(samples[i].get("entities", []), self.allowed_labels)
-            unmatched_preds = list(pred)
+            gold = normalize_prediction(
+                sample.get("entities", []),
+                self.allowed_labels,
+            )
+            errors = classify_prediction_errors(text, prediction, gold)
 
-            for gold_entity in gold:
-                gold_text = gold_entity["entity_text"]
-                gold_type = gold_entity["entity_type"]
-                exact_match = next((p for p in unmatched_preds if p["entity_text"] == gold_text), None)
-                if exact_match:
-                    unmatched_preds.remove(exact_match)
-                    pred_type = exact_match["entity_type"]
-                    if pred_type != gold_type:
-                        err_data = {
-                            "msg": f"Predicted type {pred_type}, correct type {gold_type}, entity {gold_text}",
-                            "text": text,
-                            "gold": gold_entity,
-                            "pred": exact_match,
-                            "full_gold": gold,
-                        }
-                        if gold_type in errors_by_label_cat:
-                            errors_by_label_cat[gold_type]["Type Error"].append(err_data)
-                        if pred_type in errors_by_label_cat:
-                            errors_by_label_cat[pred_type]["Type Error"].append(err_data)
-                    continue
+            for error_index, error in enumerate(errors):
+                error["sample_index"] = sample_index
+                error["error_index"] = error_index
+                error["error_id"] = f"{sample_index}:{error_index}"
+                error["full_gold"] = gold
+                error["baseline_pred"] = prediction
+                errors_by_group.setdefault(error["group_key"], []).append(error)
 
-                boundary_match = next(
-                    (
-                        p
-                        for p in unmatched_preds
-                        if gold_text in p["entity_text"] or p["entity_text"] in gold_text
-                    ),
-                    None,
-                )
-                if boundary_match:
-                    unmatched_preds.remove(boundary_match)
-                    err_data = {
-                        "msg": (
-                            f"Predicted boundary {boundary_match['entity_text']} ({boundary_match['entity_type']}), "
-                            f"correct boundary {gold_text} ({gold_type})"
-                        ),
-                        "text": text,
-                        "gold": gold_entity,
-                        "pred": boundary_match,
-                        "full_gold": gold,
-                    }
-                    if gold_type in errors_by_label_cat:
-                        errors_by_label_cat[gold_type]["Boundary Error"].append(err_data)
-                    if boundary_match["entity_type"] in errors_by_label_cat:
-                        errors_by_label_cat[boundary_match["entity_type"]]["Boundary Error"].append(err_data)
-                    continue
+        return errors_by_group
 
-                err_data = {
-                    "msg": f"Entity {gold_text} ({gold_type}) was missed.",
-                    "text": text,
-                    "gold": gold_entity,
-                    "pred": None,
-                    "full_gold": gold,
-                }
-                if gold_type in errors_by_label_cat:
-                    errors_by_label_cat[gold_type]["Missed Entity"].append(err_data)
+    def _build_active_tasks(
+        self,
+        errors_by_group: Dict[str, List[Dict[str, Any]]],
+    ) -> List[Dict[str, Any]]:
+        """
+        Keep only groups with at least tau distinct seed samples. Split by
+        sample (not by individual error) so one sentence cannot occur in both
+        the induction and independent verification subsets.
 
-            for pred_entity in unmatched_preds:
-                pred_type = pred_entity["entity_type"]
-                err_data = {
-                    "msg": f"Predicted {pred_entity['entity_text']} ({pred_type}) but it is not an entity.",
-                    "text": text,
-                    "gold": None,
-                    "pred": pred_entity,
-                    "full_gold": gold,
-                }
-                if pred_type in errors_by_label_cat:
-                    errors_by_label_cat[pred_type]["Hallucination Error"].append(err_data)
-
-        return errors_by_label_cat
-
-    def _build_active_tasks(self, errors_by_label_cat: Dict[str, Dict[str, List[Dict[str, Any]]]]) -> List[Dict[str, Any]]:
+        The paper fixes tau=5 and lambda=2 but does not specify a split ratio;
+        reserve lambda distinct samples for S_g,ver.
+        """
         active_tasks = []
-        task_id = 0
-        for label in self.allowed_labels:
-            for category in self.error_categories:
-                pool = errors_by_label_cat[label][category]
-                if not pool:
-                    continue
-                active_tasks.append(
-                    {
-                        "task_id": task_id,
-                        "label": label,
-                        "category": category,
-                        "original_pool": pool,
-                        "unresolved_pool": list(pool),
-                    }
-                )
-                task_id += 1
+        for task_id, (group_key, pool) in enumerate(sorted(errors_by_group.items())):
+            samples_by_id: Dict[Any, List[Dict[str, Any]]] = {}
+            for error in pool:
+                sample_id = error.get("text", error.get("sample_index"))
+                samples_by_id.setdefault(sample_id, []).append(error)
+
+            if len(samples_by_id) < self.tau:
+                continue
+
+            sample_ids = list(samples_by_id)
+            random.shuffle(sample_ids)
+
+            verification_size = self.lambda_global
+            if len(sample_ids) <= verification_size:
+                continue
+
+            verification_ids = set(sample_ids[:verification_size])
+            source_ids = set(sample_ids[verification_size:])
+
+            source_pool = [
+                error
+                for sample_id, sample_errors in samples_by_id.items()
+                if sample_id in source_ids
+                for error in sample_errors
+            ]
+            verification_pool = [
+                error
+                for sample_id, sample_errors in samples_by_id.items()
+                if sample_id in verification_ids
+                for error in sample_errors
+            ]
+
+            if not source_pool or not verification_pool:
+                continue
+
+            first = pool[0]
+            active_tasks.append({
+                "task_id": task_id,
+                "group_key": group_key,
+                "label": first["group_label"],
+                "category": first["category"],
+                "source_pool": source_pool,
+                "verification_pool": verification_pool,
+                "source_sample_ids": source_ids,
+                "verification_sample_ids": verification_ids,
+            })
+
         return active_tasks
 
-    def learn_from_data(self, practice_data: List[Dict[str, Any]], sample_size: int = 200) -> Tuple[Dict[str, Any], int]:
-        print(color_text(f"\n[Global] Error analysis on {sample_size} samples...", "yellow"))
-        samples = random.sample(practice_data, sample_size) if len(practice_data) > sample_size else practice_data
+    @staticmethod
+    def _context(error: Dict[str, Any], split: str) -> Dict[str, Any]:
+        return {
+            "text": error.get("text", ""),
+            "gold": error.get("full_gold", error.get("gold", [])),
+            "pred": error.get("baseline_pred", error.get("pred", [])),
+            "error": error.get("msg", ""),
+            "target_mention": error.get("target_mention", ""),
+            "split": split,
+        }
 
-        pred_prompts = [
-            ZERO_SHOT_PREDICTION_PROMPT.format(init_instruction=self.init_instruction, text=item["text"])
+    @staticmethod
+    def _extract_rules(raw_output: str) -> List[str]:
+        parsed = parse_json_robust(raw_output)
+        if isinstance(parsed, str):
+            parsed = [parsed]
+        if not isinstance(parsed, list):
+            return []
+
+        rules = []
+        for rule_text in parsed[:2]:
+            if not isinstance(rule_text, str):
+                continue
+            rule_text = re.sub(
+                r"^(?:Rule\s*\d+:?|[-*•]|\d+\.)\s*",
+                "",
+                rule_text.strip(),
+                flags=re.IGNORECASE,
+            ).strip(chr(34) + "'")
+            if len(rule_text) >= 5 and rule_text not in rules:
+                rules.append(rule_text)
+        return rules
+
+    def _evaluate_candidates(
+        self,
+        candidates: List[Dict[str, Any]],
+    ) -> Dict[int, Dict[str, List[Dict[str, Any]]]]:
+        validation_prompts = []
+        validation_meta = []
+
+        for candidate_index, candidate in enumerate(candidates):
+            task = candidate["task"]
+            for split_name, pool in (
+                ("source", task["source_pool"]),
+                ("verification", task["verification_pool"]),
+            ):
+                for error in pool:
+                    validation_prompts.append(
+                        VERIFICATION_AGENT_PROMPT.format(
+                            entity_type_definitions=self.labels_str,
+                            r=candidate["rule"],
+                            X_i=error["text"],
+                        )
+                    )
+                    validation_meta.append({
+                        "candidate_index": candidate_index,
+                        "split": split_name,
+                        "error": error,
+                    })
+
+        outputs = generate_texts(
+            self.llm,
+            validation_prompts,
+            max_tokens=1024,
+            temperature=0.0,
+        )
+        self.token_usage += get_token_stats(outputs)
+
+        evaluations = {
+            index: {
+                "source_corrected": [],
+                "verification_unseen_corrected": [],
+            }
+            for index in range(len(candidates))
+        }
+
+        for meta, output in zip(validation_meta, outputs):
+            candidate_index = meta["candidate_index"]
+            error = meta["error"]
+            new_prediction = normalize_prediction(
+                parse_json_robust(output.outputs[0].text),
+                self.allowed_labels,
+                original_input_text=error["text"],
+            )
+
+            corrected = (
+                is_target_error_corrected(error, new_prediction)
+                and not introduces_new_errors(
+                    error["baseline_pred"],
+                    new_prediction,
+                    error["full_gold"],
+                )
+            )
+            if not corrected:
+                continue
+
+            if meta["split"] == "source":
+                evaluations[candidate_index]["source_corrected"].append(error)
+            else:
+                source_mentions = {
+                    item.get("target_mention", "")
+                    for item in candidates[candidate_index]["task"]["source_pool"]
+                }
+                target_mention = error.get("target_mention", "")
+                if target_mention and target_mention not in source_mentions:
+                    evaluations[candidate_index][
+                        "verification_unseen_corrected"
+                    ].append(error)
+
+        return evaluations
+
+    def learn_from_data(
+        self,
+        practice_data: List[Dict[str, Any]],
+        sample_size: int = 200,
+    ) -> Tuple[Dict[str, Any], int]:
+        print(
+            color_text(
+                f"\n[Global] Error analysis on {sample_size} samples...",
+                "yellow",
+            )
+        )
+        samples = (
+            random.sample(practice_data, sample_size)
+            if len(practice_data) > sample_size
+            else list(practice_data)
+        )
+
+        prediction_prompts = [
+            ZERO_SHOT_PREDICTION_PROMPT.format(
+                init_instruction=self.init_instruction,
+                text=item["text"],
+            )
             for item in samples
         ]
-        pred_outputs = generate_texts(self.llm, pred_prompts, max_tokens=1024, temperature=0.0)
-        self.token_usage += get_token_stats(pred_outputs)
+        prediction_outputs = generate_texts(
+            self.llm,
+            prediction_prompts,
+            max_tokens=1024,
+            temperature=0.0,
+        )
+        self.token_usage += get_token_stats(prediction_outputs)
 
-        errors_by_label_cat = self._classify_errors(samples, pred_outputs)
-        active_tasks = self._build_active_tasks(errors_by_label_cat)
+        errors_by_group = self._classify_errors(samples, prediction_outputs)
+        active_tasks = self._build_active_tasks(errors_by_group)
 
-        print(color_text("[Global] Rule synthesis and validation...", "yellow"))
+        print(
+            color_text(
+                f"[Global] Rule synthesis and validation: "
+                f"{len(active_tasks)} eligible error groups "
+                f"(tau={self.tau}, lambda={self.lambda_global})",
+                "yellow",
+            )
+        )
+
         for attempt in range(self.max_retries):
             if not active_tasks:
                 break
-            print(color_text(f"Global attempt {attempt + 1}/{self.max_retries}, active groups={len(active_tasks)}", "cyan"))
+
+            print(
+                color_text(
+                    f"Global attempt {attempt + 1}/{self.max_retries}, "
+                    f"active groups={len(active_tasks)}",
+                    "cyan",
+                )
+            )
 
             synthesis_prompts = []
             synthesis_refs = []
             for task in active_tasks:
-                subset = random.sample(task["unresolved_pool"], min(10, len(task["unresolved_pool"])))
+                source_examples = task["source_pool"]
                 global_episodic_memory = "\n".join(
-                    f"- Error: {err['msg']}\n  Text: {err['text']}\n  Gold: {json.dumps(err['full_gold'], ensure_ascii=False)}"
-                    for err in subset
+                    (
+                        f"- Error: {error['msg']}\n"
+                        f"  Text: {error['text']}\n"
+                        f"  Gold: {json.dumps(error['full_gold'], ensure_ascii=False)}\n"
+                        f"  Zero-shot prediction: "
+                        f"{json.dumps(error['baseline_pred'], ensure_ascii=False)}"
+                    )
+                    for error in source_examples
                 )
                 synthesis_prompts.append(
                     GLOBAL_REFLECTION_PROMPT.format(
@@ -180,100 +363,90 @@ class GlobalRuleLearner:
                         global_episodic_memory=global_episodic_memory,
                     )
                 )
-                synthesis_refs.append((task, subset))
+                synthesis_refs.append(task)
 
-            rule_outputs = generate_texts(self.llm, synthesis_prompts, max_tokens=256, temperature=0.3)
+            rule_outputs = generate_texts(
+                self.llm,
+                synthesis_prompts,
+                max_tokens=256,
+                temperature=0.3,
+            )
             self.token_usage += get_token_stats(rule_outputs)
 
             candidates = []
-            for i, output in enumerate(rule_outputs):
-                task, subset = synthesis_refs[i]
-                parsed = parse_json_robust(output.outputs[0].text)
-                if isinstance(parsed, str):
-                    parsed = [parsed]
-                if not isinstance(parsed, list):
-                    parsed = []
-                for rule_text in parsed[:2]:
-                    if not isinstance(rule_text, str):
-                        continue
-                    rule_text = re.sub(r"^(?:Rule\s*\d+:?|[-*•]|\d+\.)\s*", "", rule_text.strip(), flags=re.IGNORECASE).strip("\"'")
-                    if len(rule_text) < 5:
-                        continue
-                    contexts = [{"text": err["text"], "gold": err["full_gold"]} for err in subset[:3]]
-                    sources = [err["text"] for err in subset[:3]]
-                    self._add_rule(self.global_rules_map_unvalidated, task["label"], task["category"], rule_text, contexts, sources)
-                    candidates.append({"task": task, "rule": rule_text})
+            for task, output in zip(synthesis_refs, rule_outputs):
+                for rule_text in self._extract_rules(output.outputs[0].text):
+                    source_contexts = [
+                        self._context(error, "source")
+                        for error in task["source_pool"]
+                    ]
+                    self._add_rule(
+                        self.global_rules_map_unvalidated,
+                        task,
+                        rule_text,
+                        source_contexts,
+                    )
+                    candidates.append({
+                        "task": task,
+                        "rule": rule_text,
+                    })
 
             if not candidates:
                 continue
 
-            validation_prompts = []
-            validation_meta = []
-            for candidate_id, candidate in enumerate(candidates):
+            evaluations = self._evaluate_candidates(candidates)
+            completed_task_ids = set()
+
+            for candidate_index, candidate in enumerate(candidates):
                 task = candidate["task"]
-                for err_data in task["original_pool"]:
-                    validation_prompts.append(
-                        VERIFICATION_AGENT_PROMPT.format(
-                            entity_type_definitions=self.labels_str,
-                            r=candidate["rule"],
-                            X_i=err_data["text"],
-                        )
-                    )
-                    validation_meta.append({"candidate_id": candidate_id, "err_data": err_data})
+                evaluation = evaluations[candidate_index]
+                source_corrected = evaluation["source_corrected"]
+                verification_unseen = evaluation["verification_unseen_corrected"]
 
-            validation_outputs = generate_texts(self.llm, validation_prompts, max_tokens=1024, temperature=0.0)
-            self.token_usage += get_token_stats(validation_outputs)
-
-            fixed_by_candidate = {i: [] for i in range(len(candidates))}
-            for output_id, validation_output in enumerate(validation_outputs):
-                meta = validation_meta[output_id]
-                err_data = meta["err_data"]
-                new_pred = normalize_prediction(
-                    parse_json_robust(validation_output.outputs[0].text),
-                    self.allowed_labels,
-                    original_input_text=err_data["text"],
+                passes_source = (
+                    len(source_corrected) > len(task["source_pool"]) / 2
                 )
-                gold_entity = err_data.get("gold")
-                is_fixed = False
-                if gold_entity:
-                    is_fixed = any(
-                        pred["entity_text"] == gold_entity["entity_text"]
-                        and pred["entity_type"] == gold_entity["entity_type"]
-                        for pred in new_pred
-                    )
-                else:
-                    bad_pred = err_data.get("pred")
-                    if bad_pred:
-                        is_fixed = not any(pred["entity_text"] == bad_pred["entity_text"] for pred in new_pred)
-                if is_fixed:
-                    fixed_by_candidate[meta["candidate_id"]].append(err_data)
-
-            fixed_texts_by_task: Dict[int, set] = {}
-            for candidate_id, fixed_errors in fixed_by_candidate.items():
-                if not fixed_errors:
+                passes_verification = (
+                    len(verification_unseen) >= self.lambda_global
+                )
+                if not (passes_source and passes_verification):
                     continue
-                candidate = candidates[candidate_id]
-                task = candidate["task"]
-                contexts = [{"text": err["text"], "gold": err["full_gold"]} for err in fixed_errors]
-                sources = [err["text"] for err in fixed_errors]
+
+                support_contexts = [
+                    self._context(error, "source")
+                    for error in source_corrected
+                ] + [
+                    self._context(error, "verification")
+                    for error in verification_unseen
+                ]
                 self._add_rule(
                     self.global_rules_map_validated,
-                    task["label"],
-                    task["category"],
+                    task,
                     candidate["rule"],
-                    contexts,
-                    sources,
+                    support_contexts,
                 )
-                fixed_texts_by_task.setdefault(task["task_id"], set()).update(sources)
+                completed_task_ids.add(task["task_id"])
 
-            next_active_tasks = []
-            for task in active_tasks:
-                fixed_texts = fixed_texts_by_task.get(task["task_id"], set())
-                if fixed_texts:
-                    task["unresolved_pool"] = [err for err in task["unresolved_pool"] if err["text"] not in fixed_texts]
-                if task["unresolved_pool"]:
-                    next_active_tasks.append(task)
-            active_tasks = next_active_tasks
+            # Keep the existing bounded retry behavior for groups for which
+            # none of the generated candidates passed the paper's criteria.
+            active_tasks = [
+                task for task in active_tasks
+                if task["task_id"] not in completed_task_ids
+            ]
+
+        validated_count = sum(
+            len(items) for items in self.global_rules_map_validated.values()
+        )
+        candidate_count = sum(
+            len(items) for items in self.global_rules_map_unvalidated.values()
+        )
+        print(
+            color_text(
+                f"[Global] Candidate rules={candidate_count}, "
+                f"validated rules={validated_count}",
+                "green",
+            )
+        )
 
         return {
             "validated": self.global_rules_map_validated,
